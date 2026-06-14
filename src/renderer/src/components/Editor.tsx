@@ -8,9 +8,17 @@ interface EditorProps {
   onChange: (val: string) => void
   onSave: () => void
   fileName: string
+  filePath?: string
 }
 
-function Editor({ content, onChange, onSave, fileName }: EditorProps) {
+const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico'])
+
+function isImageFile(name: string): boolean {
+  const ext = name.split('.').pop()?.toLowerCase()
+  return ext ? IMAGE_EXTS.has(ext) : false
+}
+
+function Editor({ content, onChange, onSave, fileName, filePath }: EditorProps) {
   const [previewMode, setPreviewMode] = useState<PreviewMode>('edit')
 
   useEffect(() => {
@@ -64,7 +72,30 @@ function Editor({ content, onChange, onSave, fileName }: EditorProps) {
         </div>
       </div>
       <div className="editor-body" data-color-mode="dark">
-        {previewMode === 'preview' ? (
+        {isImageFile(fileName) && filePath ? (
+          <div
+            style={{
+              flex: 1,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              overflow: 'auto',
+              background: '#1e1e2e',
+              padding: 24,
+            }}
+          >
+            <img
+              src={`file://${filePath}`}
+              alt={fileName}
+              style={{
+                maxWidth: '100%',
+                maxHeight: '100%',
+                objectFit: 'contain',
+                borderRadius: 8,
+              }}
+            />
+          </div>
+        ) : previewMode === 'preview' ? (
           <div
             style={{
               flex: 1,

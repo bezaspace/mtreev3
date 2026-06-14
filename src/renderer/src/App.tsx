@@ -112,6 +112,7 @@ function App() {
             onChange={setContent}
             onSave={saveContent}
             fileName={activeFile ? activeFile.split('/').pop()! : 'No file open'}
+            filePath={activeFile || undefined}
           />
         ) : (
           <Suspense fallback={<div className="graph-empty"><h3>Loading graph...</h3></div>}>
