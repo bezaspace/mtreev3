@@ -1,6 +1,8 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs/promises'
+import { handleChatStream } from './ai/chat-stream'
+import { loadAIConfig, saveAIConfig } from './ai/store'
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
 
@@ -155,3 +157,36 @@ ipcMain.handle(
     return results
   }
 )
+
+// --- AI IPC Handlers ---
+
+ipcMain.handle(
+  'ai:send',
+  async (event, messages: any[], config: any, context: any) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win) {
+      console.error('[AI IPC] no window found for sender')
+      return
+    }
+    console.log('[AI IPC] ai:send received', {
+      windowId: win.id,
+      messageCount: messages?.length ?? 0,
+      lastMessage: messages?.length ? messages[messages.length - 1] : null,
+    })
+    const mergedContext = context || { rootDir: null, activeFile: null, activeContent: '', allFiles: [] }
+    // Fire-and-forget stream; errors caught internally
+    handleChatStream({
+      messages,
+      config: config || {},
+      context: mergedContext,
+      windowId: win.id,
+    }).catch((err) => {
+      console.error('[AI IPC] AI stream error:', err)
+      win.webContents.send('ai:done')
+    })
+    return
+  }
+)
+
+ipcMain.handle('ai:loadConfig', async () => loadAIConfig())
+ipcMain.handle('ai:saveConfig', async (_event, config) => saveAIConfig(config))

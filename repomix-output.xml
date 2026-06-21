@@ -40,31 +40,575 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
-main/
-  index.ts
-preload/
-  index.ts
-renderer/
-  src/
-    components/
-      Editor.tsx
-      GraphView.tsx
-      Sidebar.tsx
-    types/
-      electron.d.ts
-    App.css
-    App.tsx
-    main.tsx
-  index.html
+ai/
+  agents.ts
+  chat-stream.ts
+  provider.ts
+  store.ts
+  tools.ts
+index.ts
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
-<file path="main/index.ts">
+<file path="ai/agents.ts">
+import { ModelMessage } from 'ai'
+
+export type AgentType = 'general' | 'noteEditor' | 'knowledge' | 'graph'
+
+export interface AgentConfig {
+  system: string
+  type: AgentType
+  label: string
+}
+
+export function getAgent(type: AgentType): AgentConfig {
+  const base = `You are a helpful AI assistant inside Marktree, a markdown note-taking app with a graph view. The user keeps their notes in a folder called a "vault". You have access to tools that let you read, write, search, and create notes, as well as inspect the graph of connections between notes.
+
+CRITICAL RULES:
+- You MUST use tools when answering questions about the user's vault, notes, active note, graph, or file list. Do not rely on memory or training data.
+- If the user asks about "important files", "my notes", "the vault", "the graph", or anything that requires looking at the current state, call the relevant tools FIRST (e.g., getActiveNote, getGraphData, listNotes, searchNotes) before writing your final answer.
+- Do not say you will check something; actually call the tool to check it.
+- After calling a tool, wait for the result and use it in your answer.
+- Be concise, helpful, and natural.`
+
+  switch (type) {
+    case 'noteEditor':
+      return {
+        type: 'noteEditor',
+        label: 'Note Editor',
+        system: `${base}
+Your specialty is creating and editing notes. You can:
+- Create new notes with createNote
+- Read existing notes with readNote
+- Write/update notes with writeNote
+- Get the currently open note with getActiveNote
+
+STRICT RULES:
+- If the user asks to create, write, or edit a note or file, you MUST call the appropriate tool (createNote, writeNote, or readNote) in your first step. Do not answer with text before calling the tool.
+- After you receive the tool result, confirm what you did with the actual file path.
+- When editing, preserve the user's existing style and formatting. Use markdown best practices. If the user asks to "fix" or "improve" a note, make targeted edits rather than full rewrites unless asked.`,
+      }
+
+    case 'knowledge':
+      return {
+        type: 'knowledge',
+        label: 'Knowledge',
+        system: `${base}
+Your specialty is searching, summarizing, and connecting knowledge across the vault. You can:
+- Search notes with searchNotes
+- List all notes with listNotes
+- Read specific notes with readNote
+
+Help the user find information, synthesize across notes, identify gaps, and suggest connections. When answering, cite note names using [[WikiLink]] syntax.`,
+      }
+
+    case 'graph':
+      return {
+        type: 'graph',
+        label: 'Graph',
+        system: `${base}
+Your specialty is analyzing the vault's graph structure. You can:
+- Get graph data with getGraphData
+- Search notes with searchNotes
+- Read notes with readNote
+
+Help the user understand their note network: find orphaned notes, suggest missing links, identify clusters, and recommend structure improvements. Use [[WikiLink]] syntax when referring to notes.`,
+      }
+
+    case 'general':
+    default:
+      return {
+        type: 'general',
+        label: 'General',
+        system: `${base}
+You are the general-purpose assistant. You can use any available tool. Use tools proactively whenever the question involves the vault, notes, active note, or graph. Do not just describe what you would do; actually call the tools and use the returned data. If a task clearly fits another specialist (editing notes, deep search, graph analysis), mention it but still help directly.`,
+      }
+  }
+}
+
+export async function routerAgent(
+  model: any,
+  messages: ModelMessage[]
+): Promise<AgentType> {
+  console.log('[AI router] classifying intent')
+  const { generateText } = await import('ai')
+  const { text } = await generateText({
+    model,
+    temperature: 0.1,
+    maxOutputTokens: 60,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are a tiny routing classifier. Given a user message, pick the single best specialist agent. Respond with ONLY one word: general, noteEditor, knowledge, or graph. No explanation.\n\n- noteEditor: creating, writing, editing, updating, deleting, or renaming notes/files in the vault.\n- knowledge: searching, finding, summarizing, or connecting notes.\n- graph: analyzing graph structure, links, or connections.\n- general: everything else.',
+      },
+      ...messages,
+    ],
+  })
+  const t = text.trim().toLowerCase()
+  console.log('[AI router] raw response:', JSON.stringify(text))
+  if (t.includes('noteeditor') || (t.includes('note') && t.includes('editor'))) return 'noteEditor'
+  if (t.includes('knowledge') || t.includes('search') || t.includes('find')) return 'knowledge'
+  if (t.includes('graph') || t.includes('link') || t.includes('connect')) return 'graph'
+  return 'general'
+}
+</file>
+
+<file path="ai/chat-stream.ts">
+import { streamText, convertToModelMessages, stepCountIs } from 'ai'
+import type { UIMessage } from 'ai'
+import { getModel, AIProviderConfig } from './provider'
+import { buildTools, ToolContext } from './tools'
+import { routerAgent, getAgent } from './agents'
+import { BrowserWindow } from 'electron'
+
+export interface ChatRequest {
+  messages: UIMessage[]
+  config: Partial<AIProviderConfig>
+  context: ToolContext
+  windowId?: number
+}
+
+export async function handleChatStream(req: ChatRequest) {
+  const startTime = Date.now()
+  const model = getModel(req.config)
+  const tools = buildTools({
+    ...req.context,
+    onFileChange: (filePath, action) => {
+      console.log('[AI] file-change event:', action, filePath)
+      if (req.windowId) {
+        const win = BrowserWindow.fromId(req.windowId)
+        if (win) {
+          win.webContents.send('fs:fileChange', { filePath, action })
+        }
+      }
+    },
+  })
+
+  console.log('[AI] ---------- chat started ----------')
+  console.log('[AI] context:', {
+    rootDir: req.context.rootDir,
+    activeFile: req.context.activeFile,
+    activeContentLength: req.context.activeContent.length,
+    allFilesCount: req.context.allFiles.length,
+  })
+  console.log('[AI] model config:', req.config)
+
+  // Router: classify intent
+  const messagesForModel = req.messages.map(({ id: _id, ...rest }) => rest)
+  const coreMessages = await convertToModelMessages(messagesForModel)
+  console.log('[AI] converted messages:', coreMessages.length)
+  coreMessages.forEach((m, i) => console.log(`[AI] msg[${i}] role=${(m as any).role} content=${String((m as any).content || '').slice(0, 120)}`))
+
+  const agentType = await routerAgent(model, coreMessages)
+  const agent = getAgent(agentType)
+  console.log('[AI] router selected agent:', agentType, `(${agent.label})`)
+  console.log('[AI] system prompt length:', agent.system.length)
+
+  console.log('[AI] calling streamText with tools, stopWhen stepCountIs(5)')
+  const result = streamText({
+    model,
+    system: agent.system,
+    messages: coreMessages,
+    tools,
+    stopWhen: stepCountIs(5),
+    prepareStep: async ({ stepNumber }) => {
+      if (stepNumber === 1 && agentType !== 'general') {
+        console.log('[AI] prepareStep: forcing toolChoice required for first step of', agentType)
+        return { toolChoice: 'required' }
+      }
+      return {}
+    },
+    onStepFinish: (step) => {
+      console.log('[AI] onStepFinish:', {
+        stepNumber: (step as any).stepNumber,
+        finishReason: step.finishReason,
+        toolCallCount: step.toolCalls.length,
+        toolResultCount: step.toolResults.length,
+        textLength: step.text?.length ?? 0,
+        usage: step.usage,
+      })
+      step.toolCalls.forEach((t, i) => {
+        console.log(`[AI]   toolCall[${i}]`, (t as any).toolName, JSON.stringify((t as any).args).slice(0, 300))
+      })
+      step.toolResults.forEach((r, i) => {
+        const result = (r as any).result
+        console.log(`[AI]   toolResult[${i}]`, (r as any).toolName, typeof result === 'object' ? JSON.stringify(result).slice(0, 300) : String(result).slice(0, 300))
+      })
+      // Stream tool call indicators to renderer
+      if (req.windowId) {
+        const win = BrowserWindow.fromId(req.windowId)
+        if (win) {
+          win.webContents.send('ai:step', {
+            toolCalls: step.toolCalls.map((t) => ({
+              toolName: (t as any).toolName,
+              args: (t as any).args,
+            })),
+            toolResults: step.toolResults.map((r) => ({
+              toolName: (r as any).toolName,
+              result:
+                typeof (r as any).result === 'object'
+                  ? JSON.stringify((r as any).result).slice(0, 500)
+                  : String((r as any).result).slice(0, 500),
+            })),
+          })
+        }
+      }
+    },
+    onError: (event) => {
+      console.error('[AI] streamText onError:', event.error)
+    },
+  })
+
+  // Send agent type info
+  if (req.windowId) {
+    const win = BrowserWindow.fromId(req.windowId)
+    if (win) {
+      win.webContents.send('ai:agent', { type: agentType, label: agent.label })
+    }
+  }
+
+  // Stream text chunks to renderer
+  console.log('[AI] consuming textStream')
+  let chunkCount = 0
+  for await (const chunk of result.textStream) {
+    chunkCount++
+    if (chunkCount <= 3 || chunkCount % 10 === 0) {
+      console.log(`[AI] text chunk #${chunkCount}:`, chunk.slice(0, 100))
+    }
+    if (req.windowId) {
+      const win = BrowserWindow.fromId(req.windowId)
+      if (win) {
+        win.webContents.send('ai:chunk', chunk)
+      }
+    }
+  }
+
+  console.log('[AI] textStream consumed, total chunks:', chunkCount)
+
+  try {
+    const finalText = await result.text
+    const finalToolCalls = await (result as any).toolCalls
+    const finalToolResults = await (result as any).toolResults
+    const finalSteps = await (result as any).steps
+    console.log('[AI] final result:', {
+      textLength: finalText?.length ?? 0,
+      toolCallsCount: finalToolCalls?.length ?? 0,
+      toolResultsCount: finalToolResults?.length ?? 0,
+      stepsCount: finalSteps?.length ?? 0,
+    })
+  } catch (e) {
+    console.error('[AI] failed to read final result:', e)
+  }
+
+  // Signal completion
+  if (req.windowId) {
+    const win = BrowserWindow.fromId(req.windowId)
+    if (win) {
+      win.webContents.send('ai:done')
+    }
+  }
+
+  console.log(`[AI] ---------- chat finished (${Date.now() - startTime}ms) ----------`)
+}
+</file>
+
+<file path="ai/provider.ts">
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
+
+export interface AIProviderConfig {
+  baseURL: string
+  apiKey: string
+  model: string
+}
+
+const DEFAULT_CONFIG: AIProviderConfig = {
+  baseURL: 'https://api.kilo.ai/api/gateway',
+  apiKey: '',
+  model: 'stepfun/step-3.7-flash:free',
+}
+
+export function getProvider(config?: Partial<AIProviderConfig>) {
+  const merged = { ...DEFAULT_CONFIG, ...config }
+  return createOpenAICompatible({
+    name: 'marktree-ai',
+    baseURL: merged.baseURL,
+    apiKey: merged.apiKey,
+  })
+}
+
+export function getModel(config?: Partial<AIProviderConfig>) {
+  const provider = getProvider(config)
+  const merged = { ...DEFAULT_CONFIG, ...config }
+  return provider(merged.model)
+}
+</file>
+
+<file path="ai/store.ts">
+import path from 'node:path'
+import fs from 'node:fs/promises'
+import { app } from 'electron'
+import { AIProviderConfig } from '../../preload/index'
+
+const CONFIG_FILE = 'ai-config.json'
+
+async function getConfigPath(): Promise<string> {
+  const userData = app.getPath('userData')
+  return path.join(userData, CONFIG_FILE)
+}
+
+export async function loadAIConfig(): Promise<AIProviderConfig> {
+  const filePath = await getConfigPath()
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8')
+    const parsed = JSON.parse(raw)
+    return {
+      baseURL: parsed.baseURL || 'https://api.kilo.ai/api/gateway',
+      apiKey: parsed.apiKey || '',
+      model: parsed.model || 'stepfun/step-3.7-flash:free',
+    }
+  } catch {
+    return {
+      baseURL: 'https://api.kilo.ai/api/gateway',
+      apiKey: '',
+      model: 'stepfun/step-3.7-flash:free',
+    }
+  }
+}
+
+export async function saveAIConfig(config: AIProviderConfig): Promise<void> {
+  const filePath = await getConfigPath()
+  await fs.writeFile(filePath, JSON.stringify(config, null, 2), 'utf-8')
+}
+</file>
+
+<file path="ai/tools.ts">
+import { z } from 'zod'
+import { tool } from 'ai'
+import fs from 'node:fs/promises'
+import path from 'node:path'
+
+export interface ToolContext {
+  rootDir: string | null
+  activeFile: string | null
+  activeContent: string
+  allFiles: Array<{ name: string; path: string; isDirectory: boolean }>
+  onFileChange?: (filePath: string, action: 'created' | 'modified') => void
+}
+
+const EmptySchema = z.object({})
+
+const ReadNoteSchema = z.object({
+  fileName: z.string().describe('The file name or relative path of the note to read'),
+})
+
+const WriteNoteSchema = z.object({
+  fileName: z.string().describe('Target file name or relative path'),
+  content: z.string().describe('Full markdown content to write'),
+})
+
+const SearchNotesSchema = z.object({
+  query: z.string().describe('Search term to look for in note contents'),
+})
+
+const CreateNoteSchema = z.object({
+  fileName: z.string().describe('File name for the new note, e.g. "Project Ideas.md"'),
+  content: z.string().optional().describe('Optional initial markdown content'),
+})
+
+export function buildTools(ctx: ToolContext) {
+  return {
+    getActiveNote: tool({
+      description: 'Get the currently open note content and file path',
+      inputSchema: EmptySchema,
+      execute: async () => {
+        console.log('[AI tool] getActiveNote called')
+        if (!ctx.activeFile) {
+          console.log('[AI tool] getActiveNote -> no active file')
+          return { filePath: null, content: null, name: null }
+        }
+        const result = {
+          filePath: ctx.activeFile,
+          name: path.basename(ctx.activeFile),
+          content: ctx.activeContent,
+        }
+        console.log('[AI tool] getActiveNote ->', result.name, `${result.content.length} chars`)
+        return result
+      },
+    }),
+
+    readNote: tool({
+      description: 'Read a note by its file name or relative path',
+      inputSchema: ReadNoteSchema,
+      execute: async (args: z.infer<typeof ReadNoteSchema>) => {
+        console.log('[AI tool] readNote called:', args.fileName)
+        if (!ctx.rootDir) {
+          console.log('[AI tool] readNote -> no vault open')
+          return { error: 'No vault open' }
+        }
+        const filePath = path.join(ctx.rootDir, args.fileName)
+        try {
+          const content = await fs.readFile(filePath, 'utf-8')
+          console.log('[AI tool] readNote -> success', path.basename(filePath), `${content.length} chars`)
+          return { filePath, name: path.basename(filePath), content }
+        } catch (e: any) {
+          console.error('[AI tool] readNote -> failed', filePath, e.message)
+          return { error: `Could not read ${args.fileName}` }
+        }
+      },
+    }),
+
+    writeNote: tool({
+      description: 'Write content to a note. Creates the file if it does not exist.',
+      inputSchema: WriteNoteSchema,
+      execute: async (args: z.infer<typeof WriteNoteSchema>) => {
+        console.log('[AI tool] writeNote called:', args.fileName, `${args.content.length} chars`)
+        if (!ctx.rootDir) {
+          console.log('[AI tool] writeNote -> no vault open')
+          return { error: 'No vault open' }
+        }
+        const filePath = path.join(ctx.rootDir, args.fileName)
+        try {
+          await fs.mkdir(path.dirname(filePath), { recursive: true })
+          await fs.writeFile(filePath, args.content, 'utf-8')
+          const stat = await fs.stat(filePath)
+          console.log('[AI tool] writeNote -> success', filePath, `${stat.size} bytes`)
+          ctx.onFileChange?.(filePath, 'modified')
+          return { filePath, name: path.basename(filePath), success: true, size: stat.size, verified: true }
+        } catch (e: any) {
+          console.error('[AI tool] writeNote -> failed', e.message)
+          return { error: e.message || 'Failed to write note' }
+        }
+      },
+    }),
+
+    listNotes: tool({
+      description: 'List all markdown notes in the vault',
+      inputSchema: EmptySchema,
+      execute: async () => {
+        console.log('[AI tool] listNotes called')
+        if (!ctx.rootDir) {
+          console.log('[AI tool] listNotes -> no vault open')
+          return { notes: [] }
+        }
+        const notes = ctx.allFiles
+          .filter((f) => f.name.endsWith('.md') && !f.isDirectory)
+          .map((f) => ({ name: f.name, path: f.path }))
+        console.log('[AI tool] listNotes ->', notes.length, 'notes')
+        return { notes }
+      },
+    }),
+
+    searchNotes: tool({
+      description: 'Full-text search across all notes in the vault',
+      inputSchema: SearchNotesSchema,
+      execute: async (args: z.infer<typeof SearchNotesSchema>) => {
+        console.log('[AI tool] searchNotes called:', args.query)
+        if (!ctx.rootDir) {
+          console.log('[AI tool] searchNotes -> no vault open')
+          return { results: [] }
+        }
+        const notes = ctx.allFiles.filter((f) => f.name.endsWith('.md') && !f.isDirectory)
+        const results: Array<{ name: string; path: string; snippet: string }> = []
+        const q = args.query.toLowerCase()
+        for (const note of notes) {
+          try {
+            const content = await fs.readFile(note.path, 'utf-8')
+            if (content.toLowerCase().includes(q)) {
+              const idx = content.toLowerCase().indexOf(q)
+              const start = Math.max(0, idx - 60)
+              const end = Math.min(content.length, idx + q.length + 120)
+              const snippet = content.slice(start, end)
+              results.push({ name: note.name, path: note.path, snippet })
+            }
+          } catch (e) {
+            console.warn('[AI tool] searchNotes -> skipped unreadable', note.path)
+          }
+        }
+        console.log('[AI tool] searchNotes ->', results.length, 'results for', args.query)
+        return { results }
+      },
+    }),
+
+    createNote: tool({
+      description: 'Create a new note with optional initial content',
+      inputSchema: CreateNoteSchema,
+      execute: async (args: z.infer<typeof CreateNoteSchema>) => {
+        console.log('[AI tool] createNote called:', args.fileName, `${(args.content || '').length} chars`)
+        if (!ctx.rootDir) {
+          console.log('[AI tool] createNote -> no vault open')
+          return { error: 'No vault open' }
+        }
+        const safeName = args.fileName.endsWith('.md') ? args.fileName : `${args.fileName}.md`
+        const filePath = path.join(ctx.rootDir, safeName)
+        try {
+          await fs.writeFile(filePath, args.content || '', 'utf-8')
+          const stat = await fs.stat(filePath)
+          console.log('[AI tool] createNote -> success', filePath, `${stat.size} bytes`)
+          ctx.onFileChange?.(filePath, 'created')
+          return { filePath, name: safeName, success: true, size: stat.size, verified: true }
+        } catch (e: any) {
+          console.error('[AI tool] createNote -> failed', e.message)
+          return { error: e.message || 'Failed to create note' }
+        }
+      },
+    }),
+
+    getGraphData: tool({
+      description: 'Get the current vault graph data: notes as nodes and wikilinks as edges',
+      inputSchema: EmptySchema,
+      execute: async () => {
+        console.log('[AI tool] getGraphData called')
+        if (!ctx.rootDir) {
+          console.log('[AI tool] getGraphData -> no vault open')
+          return { nodes: [], links: [] }
+        }
+        const notes = ctx.allFiles.filter((f) => f.name.endsWith('.md') && !f.isDirectory)
+        const nodeMap = new Map<string, { id: string; name: string }>()
+
+        for (const note of notes) {
+          const name = note.name.replace(/\.md$/, '')
+          const id = name.toLowerCase().replace(/\s+/g, '-')
+          nodeMap.set(id, { id, name })
+        }
+
+        const links: Array<{ source: string; target: string }> = []
+        for (const note of notes) {
+          try {
+            const content = await fs.readFile(note.path, 'utf-8')
+            const wikiRegex = /\[\[([^\]]+)\]\]/g
+            let match
+            while ((match = wikiRegex.exec(content)) !== null) {
+              const linkName = match[1].trim()
+              const targetId = linkName.toLowerCase().replace(/\s+/g, '-')
+              const sourceName = note.name.replace(/\.md$/, '')
+              const sourceId = sourceName.toLowerCase().replace(/\s+/g, '-')
+              if (!nodeMap.has(targetId)) {
+                nodeMap.set(targetId, { id: targetId, name: linkName })
+              }
+              links.push({ source: sourceId, target: targetId })
+            }
+          } catch (e) {
+            console.warn('[AI tool] getGraphData -> skipped unreadable', note.path)
+          }
+        }
+        const result = { nodes: Array.from(nodeMap.values()), links }
+        console.log('[AI tool] getGraphData ->', result.nodes.length, 'nodes,', result.links.length, 'links')
+        return result
+      },
+    }),
+  }
+}
+</file>
+
+<file path="index.ts">
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs/promises'
+import { handleChatStream } from './ai/chat-stream'
+import { loadAIConfig, saveAIConfig } from './ai/store'
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
 
@@ -86,6 +630,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      webSecurity: false,
     },
   })
 
@@ -218,1044 +763,39 @@ ipcMain.handle(
     return results
   }
 )
-</file>
 
-<file path="preload/index.ts">
-import { contextBridge, ipcRenderer } from 'electron'
+// --- AI IPC Handlers ---
 
-export interface FileEntry {
-  name: string
-  path: string
-  isDirectory: boolean
-}
-
-const electronAPI = {
-  selectFolder: () => ipcRenderer.invoke('fs:selectFolder'),
-  readDir: (dirPath: string) => ipcRenderer.invoke('fs:readDir', dirPath),
-  readFile: (filePath: string) => ipcRenderer.invoke('fs:readFile', filePath),
-  writeFile: (filePath: string, content: string) =>
-    ipcRenderer.invoke('fs:writeFile', filePath, content),
-  createFile: (dirPath: string, fileName: string) =>
-    ipcRenderer.invoke('fs:createFile', dirPath, fileName),
-  createFolder: (dirPath: string, folderName: string) =>
-    ipcRenderer.invoke('fs:createFolder', dirPath, folderName),
-  walk: (rootPath: string) => ipcRenderer.invoke('fs:walk', rootPath),
-  rename: (oldPath: string, newPath: string) =>
-    ipcRenderer.invoke('fs:rename', oldPath, newPath),
-}
-
-if (process.contextIsolated) {
-  try {
-    contextBridge.exposeInMainWorld('electronAPI', electronAPI)
-  } catch (error) {
-    console.error(error)
-  }
-} else {
-  ;(window as any).electronAPI = electronAPI
-}
-</file>
-
-<file path="renderer/src/components/Editor.tsx">
-import { useEffect, useRef } from 'react'
-import MDEditor from '@uiw/react-md-editor'
-
-function Editor({ content, onChange, onSave, fileName }: EditorProps) {
-  const dataAttr = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (dataAttr.current) {
-      dataAttr.current.setAttribute('data-color-mode', 'dark')
-    }
-    // Also inject CSS directly via link tags since Vite can't resolve the package CSS
-    const cssLinks = [
-      'node_modules/@uiw/react-md-editor/markdown-editor.css',
-      'node_modules/@uiw/react-markdown-preview/markdown.css',
-    ]
-    cssLinks.forEach(href => {
-      if (!document.querySelector(`link[href="${href}"]`)) {
-        const link = document.createElement('link')
-        link.rel = 'stylesheet'
-        link.href = href
-        document.head.appendChild(link)
-      }
-    })
-  }, [])
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
-        e.preventDefault()
-        onSave()
-      }
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [onSave])
-
-  return (
-    <div className="editor">
-      <div className="editor-toolbar">
-        <span className="file-name">{fileName}</span>
-        <span className="save-hint">⌘S to save</span>
-      </div>
-      <div ref={dataAttr} className="editor-body" data-color-mode="dark">
-        <MDEditor
-          value={content}
-          onChange={(val) => onChange(val || '')}
-          height="calc(100vh - 48px)"
-          preview="edit"
-          visible={true}
-          hideToolbar={false}
-        />
-      </div>
-    </div>
-  )
-}
-
-export default Editor
-</file>
-
-<file path="renderer/src/components/GraphView.tsx">
-import { useState, useEffect, useMemo, useCallback } from 'react'
-import ForceGraph2D from 'react-force-graph-2d'
-import type { FileEntry } from '../types/electron'
-
-interface GraphViewProps {
-  allFiles: FileEntry[]
-  rootDir: string | null
-  onOpenFile: (path: string) => void
-}
-
-interface GraphNode {
-  id: string
-  name: string
-  path: string
-  group: 1 | 2
-  val?: number
-}
-
-interface GraphLink {
-  source: string
-  target: string
-}
-
-function GraphView({ allFiles, rootDir, onOpenFile }: GraphViewProps) {
-  const [graphData, setGraphData] = useState<{ nodes: GraphNode[]; links: GraphLink[] }>({
-    nodes: [],
-    links: [],
-  })
-
-  const extractLinks = useCallback((content: string, sourceId: string, baseName: string) => {
-    const links: { target: string; name: string }[] = []
-
-    const wikiRegex = /\[\[([^\]]+)\]\]/g
-    let match
-    while ((match = wikiRegex.exec(content)) !== null) {
-      const link = match[1].trim()
-      links.push({ target: link.toLowerCase().replace(/\s+/g, ' '), name: link })
-    }
-
-    const mdLinkRegex = /\[([^\]]+)\]\(([^)]+\.md)\)/g
-    while ((match = mdLinkRegex.exec(content)) !== null) {
-      const link = match[2].trim()
-      links.push({ target: link.toLowerCase().replace(/\s+/g, ' '), name: link })
-    }
-
-    return links
-  }, [])
-
-  useEffect(() => {
-    if (!allFiles.length) {
-      setGraphData({ nodes: [], links: [] })
+ipcMain.handle(
+  'ai:send',
+  async (event, messages: any[], config: any, context: any) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win) {
+      console.error('[AI IPC] no window found for sender')
       return
     }
-
-    const mdFiles = allFiles.filter((f) => f.name.endsWith('.md') && !f.isDirectory)
-    const nodeMap = new Map<string, GraphNode>()
-
-    for (const file of mdFiles) {
-      const name = file.name.replace(/\.md$/, '')
-      const id = name.toLowerCase().replace(/\s+/g, '-')
-      nodeMap.set(id, {
-        id,
-        name: name,
-        path: file.path,
-        group: 1,
-        val: 1,
-      })
-    }
-
-    const linkPromises = mdFiles.map(async (file) => {
-      try {
-        const content = await window.electronAPI.readFile(file.path)
-        return { file, content }
-      } catch {
-        return { file, content: '' }
-      }
+    console.log('[AI IPC] ai:send received', {
+      windowId: win.id,
+      messageCount: messages?.length ?? 0,
+      lastMessage: messages?.length ? messages[messages.length - 1] : null,
     })
-
-    Promise.all(linkPromises).then((results) => {
-      const links: GraphLink[] = []
-
-      for (const { file, content } of results) {
-        const sourceName = file.name.replace(/\.md$/, '')
-        const sourceId = sourceName.toLowerCase().replace(/\s+/g, '-')
-        const extracted = extractLinks(content, sourceId, sourceName)
-
-        for (const link of extracted) {
-          let targetId = link.target.toLowerCase().replace(/\s+/g, '-')
-          if (!nodeMap.has(targetId)) {
-            nodeMap.set(targetId, {
-              id: targetId,
-              name: link.name,
-              path: '',
-              group: 2,
-              val: 1,
-            })
-          }
-          links.push({ source: sourceId, target: targetId })
-        }
-      }
-
-      setGraphData({
-        nodes: Array.from(nodeMap.values()),
-        links,
-      })
+    const mergedContext = context || { rootDir: null, activeFile: null, activeContent: '', allFiles: [] }
+    // Fire-and-forget stream; errors caught internally
+    handleChatStream({
+      messages,
+      config: config || {},
+      context: mergedContext,
+      windowId: win.id,
+    }).catch((err) => {
+      console.error('[AI IPC] AI stream error:', err)
+      win.webContents.send('ai:done')
     })
-  }, [allFiles, extractLinks])
-
-  const handleNodeClick = useCallback(
-    (node: GraphNode) => {
-      if (node.path && allFiles.some((f) => f.path === node.path)) {
-        onOpenFile(node.path)
-      }
-    },
-    [allFiles, onOpenFile]
-  )
-
-  return (
-    <div className="graph-view">
-      {!rootDir ? (
-        <div className="graph-empty">
-          <h3>Open a folder to see the graph view</h3>
-          <p>All your notes and their connections will appear here.</p>
-        </div>
-      ) : graphData.nodes.length === 0 ? (
-        <div className="graph-empty">
-          <h3>No markdown files found</h3>
-          <p>Create some notes to see connections.</p>
-        </div>
-      ) : (
-        <ForceGraph2D
-          graphData={graphData}
-          nodeLabel="name"
-          nodeAutoColorBy="group"
-          nodeCanvasObject={(node, ctx, globalScale) => {
-            const label = node.name
-            const fontSize = 12 / globalScale
-            ctx.font = `${fontSize}px -apple-system, sans-serif`
-            const textWidth = ctx.measureText(label).width
-            const r = 6
-            ctx.beginPath()
-            ctx.arc(node.x!, node.y!, r, 0, 2 * Math.PI, false)
-            ctx.fillStyle = node.group === 1 ? '#89b4fa' : '#fab387'
-            ctx.fill()
-            ctx.textAlign = 'center'
-            ctx.textBaseline = 'middle'
-            ctx.fillStyle = '#cdd6f4'
-            ctx.fillText(label, node.x!, node.y! - 8)
-          }}
-          onNodeClick={handleNodeClick}
-          enableNodeDrag
-          enableZoomPanInteraction
-          backgroundColor="#1e1e2e"
-          linkColor={() => '#585b70'}
-          width={window.innerWidth - (rootDir ? 280 : 0)}
-          height={window.innerHeight}
-        />
-      )}
-    </div>
-  )
-}
-
-export default GraphView
-</file>
-
-<file path="renderer/src/components/Sidebar.tsx">
-import { useState, useEffect, useCallback } from 'react'
-
-type FileEntry = { name: string; path: string; isDirectory: boolean }
-
-interface SidebarProps {
-  files: FileEntry[]
-  activeFile: string | null
-  collapsed: boolean
-  view: string
-  rootDir: string | null
-  refreshToken: number
-  pendingRename: string | null
-  onSelectRoot: () => void
-  onOpenFile: (path: string) => void
-  onCreateNote: () => void
-  onCreateFolder: () => void
-  onToggleView: () => void
-  onToggleSidebar: () => void
-  onRename: (oldPath: string, newName: string) => Promise<void>
-  onClearPendingRename: () => void
-}
-
-interface FileTreeItemProps {
-  entry: FileEntry
-  depth: number
-  activeFile: string | null
-  renamingPath: string | null
-  renameValue: string
-  expandedDirs: Set<string>
-  dirContents: Record<string, FileEntry[]>
-  pendingRename: string | null
-  onToggleDir: (path: string) => void
-  onOpenFile: (path: string) => void
-  onStartRename: (path: string, name: string) => void
-  onRenameSubmit: () => void
-  onRenameChange: (value: string) => void
-  onRenameCancel: () => void
-  onClearPendingRename: () => void
-}
-
-function FileTreeItem({
-  entry,
-  depth,
-  activeFile,
-  renamingPath,
-  renameValue,
-  expandedDirs,
-  dirContents,
-  pendingRename,
-  onToggleDir,
-  onOpenFile,
-  onStartRename,
-  onRenameSubmit,
-  onRenameChange,
-  onRenameCancel,
-  onClearPendingRename,
-}: FileTreeItemProps) {
-  const isExpanded = expandedDirs.has(entry.path)
-  const isRenaming = renamingPath === entry.path
-  const children = dirContents[entry.path] || []
-
-  useEffect(() => {
-    if (pendingRename === entry.path && !isRenaming) {
-      onStartRename(entry.path, entry.name)
-      onClearPendingRename()
-    }
-  }, [pendingRename, entry.path, entry.name, isRenaming])
-
-  const ext = entry.name.split('.').pop()
-  const icon = entry.isDirectory
-    ? isExpanded
-      ? '📂'
-      : '📁'
-    : ext === 'md'
-      ? '📝'
-      : '📄'
-
-  return (
-    <div>
-      <div
-        className={`file-item ${activeFile === entry.path ? 'active' : ''}`}
-        style={{ paddingLeft: `${depth * 16 + 14}px` }}
-        onClick={() => {
-          if (entry.isDirectory) {
-            onToggleDir(entry.path)
-          } else {
-            onOpenFile(entry.path)
-          }
-        }}
-      >
-        <span className="file-icon">{icon}</span>
-        {isRenaming ? (
-          <input
-            className="rename-input"
-            autoFocus
-            value={renameValue}
-            onChange={(e) => onRenameChange(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') onRenameSubmit()
-              if (e.key === 'Escape') onRenameCancel()
-            }}
-            onBlur={onRenameSubmit}
-            onClick={(e) => e.stopPropagation()}
-          />
-        ) : (
-          <span className="file-name">{entry.name}</span>
-        )}
-      </div>
-      {entry.isDirectory && isExpanded && (
-        <div>
-          {children.map((child) => (
-            <FileTreeItem
-              key={child.path}
-              entry={child}
-              depth={depth + 1}
-              activeFile={activeFile}
-              renamingPath={renamingPath}
-              renameValue={renameValue}
-              expandedDirs={expandedDirs}
-              dirContents={dirContents}
-              pendingRename={pendingRename}
-              onToggleDir={onToggleDir}
-              onOpenFile={onOpenFile}
-              onStartRename={onStartRename}
-              onRenameSubmit={onRenameSubmit}
-              onRenameChange={onRenameChange}
-              onRenameCancel={onRenameCancel}
-              onClearPendingRename={onClearPendingRename}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function Sidebar({
-  files,
-  activeFile,
-  collapsed,
-  view,
-  rootDir,
-  refreshToken,
-  pendingRename,
-  onSelectRoot,
-  onOpenFile,
-  onCreateNote,
-  onCreateFolder,
-  onToggleView,
-  onToggleSidebar,
-  onRename,
-  onClearPendingRename,
-}: SidebarProps) {
-  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set())
-  const [dirContents, setDirContents] = useState<Record<string, FileEntry[]>>({})
-  const [renamingPath, setRenamingPath] = useState<string | null>(null)
-  const [renameValue, setRenameValue] = useState('')
-
-  const handleToggleDir = useCallback(
-    async (dirPath: string) => {
-      const next = new Set(expandedDirs)
-      if (next.has(dirPath)) {
-        next.delete(dirPath)
-        setExpandedDirs(next)
-      } else {
-        next.add(dirPath)
-        setExpandedDirs(next)
-        if (!dirContents[dirPath]) {
-          const children = await window.electronAPI.readDir(dirPath)
-          setDirContents((prev) => ({ ...prev, [dirPath]: children }))
-        }
-      }
-    },
-    [expandedDirs, dirContents]
-  )
-
-  const handleStartRename = useCallback((path: string, name: string) => {
-    setRenamingPath(path)
-    setRenameValue(name)
-  }, [])
-
-  const handleRenameSubmit = useCallback(async () => {
-    if (!renamingPath || !renameValue.trim()) {
-      setRenamingPath(null)
-      return
-    }
-    await onRename(renamingPath, renameValue.trim())
-    setRenamingPath(null)
-  }, [renamingPath, renameValue, onRename])
-
-  const handleRenameCancel = useCallback(() => {
-    setRenamingPath(null)
-  }, [])
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'F2' && activeFile && !renamingPath) {
-        const name = activeFile.split('/').pop() || ''
-        handleStartRename(activeFile, name)
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeFile, renamingPath, handleStartRename])
-
-  useEffect(() => {
-    if (!rootDir) {
-      setExpandedDirs(new Set())
-      setDirContents({})
-    }
-  }, [rootDir, refreshToken])
-
-  return (
-    <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
-      <div className="sidebar-header">
-        <h2 className="logo">Marktree</h2>
-        <button className="icon-btn" onClick={onToggleSidebar} title="Toggle sidebar">
-          {'◀'}
-        </button>
-      </div>
-      {!collapsed && (
-        <>
-          <div className="sidebar-actions">
-            {!rootDir ? (
-              <button className="primary-btn" onClick={onSelectRoot}>
-                Open Folder
-              </button>
-            ) : (
-              <button className="secondary-btn" onClick={onSelectRoot}>
-                Change Folder
-              </button>
-            )}
-            <div className="action-row">
-              <button
-                className="icon-btn secondary"
-                onClick={onCreateNote}
-                title="New note"
-              >
-                {'＋'}
-              </button>
-              <button
-                className="icon-btn secondary"
-                onClick={onCreateFolder}
-                title="New folder"
-              >
-                {'📁'}
-              </button>
-              <button className="icon-btn secondary" onClick={onToggleView} title="Toggle view">
-                {view === 'editor' ? '◉' : '✎'}
-              </button>
-            </div>
-          </div>
-          {rootDir && (
-            <div className="folder-info">
-              <span className="folder-path" title={rootDir}>
-                {rootDir.split('/').pop()}
-              </span>
-            </div>
-          )}
-          <div className="file-tree">
-            {files.map((file) => (
-              <FileTreeItem
-                key={file.path}
-                entry={file}
-                depth={0}
-                activeFile={activeFile}
-                renamingPath={renamingPath}
-                renameValue={renameValue}
-                expandedDirs={expandedDirs}
-                dirContents={dirContents}
-                pendingRename={pendingRename}
-                onToggleDir={handleToggleDir}
-                onOpenFile={onOpenFile}
-                onStartRename={handleStartRename}
-                onRenameSubmit={handleRenameSubmit}
-                onRenameChange={setRenameValue}
-                onRenameCancel={handleRenameCancel}
-                onClearPendingRename={onClearPendingRename}
-              />
-            ))}
-          </div>
-        </>
-      )}
-    </aside>
-  )
-}
-
-export default Sidebar
-</file>
-
-<file path="renderer/src/types/electron.d.ts">
-export {}
-
-declare global {
-  interface Window {
-    electronAPI: {
-      selectFolder: () => Promise<string | null>
-      readDir: (dirPath: string) => Promise<FileEntry[]>
-      readFile: (filePath: string) => Promise<string>
-      writeFile: (filePath: string, content: string) => Promise<void>
-      createFile: (dirPath: string, fileName: string) => Promise<string>
-      createFolder: (dirPath: string, folderName: string) => Promise<string>
-      walk: (rootPath: string) => Promise<FileEntry[]>
-      rename: (oldPath: string, newPath: string) => Promise<void>
-    }
+    return
   }
-}
-</file>
-
-<file path="renderer/src/App.css">
-/* === Marktree Dark Theme === */
-/* Base colors: Catppuccin-inspired */
-
-:root {
-  --bg-base: #1e1e2e;
-  --bg-mantle: #181825;
-  --bg-crust: #11111b;
-  --bg-surface0: #313244;
-  --bg-surface1: #45475a;
-  --blue: #89b4fa;
-  --teal: #94e2d5;
-  --lavender: #b4befe;
-  --text: #cdd6f4;
-  --subtext0: #a6adc8;
-  --subtext1: #6c7086;
-  --border: #45475a;
-  --red: #f38ba8;
-  --green: #a6e3a1;
-  --yellow: #f9e2af;
-}
-
-.app {
-  display: flex;
-  height: 100vh;
-  width: 100vw;
-  background: var(--bg-base);
-}
-
-/* === Sidebar === */
-.sidebar {
-  background: var(--bg-crust);
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  width: 280px;
-  flex-shrink: 0;
-  transition: width 0.2s ease;
-  overflow: hidden;
-}
-.sidebar.collapsed {
-  width: 52px;
-}
-
-.sidebar-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 14px 12px;
-  border-bottom: 1px solid var(--border);
-  min-height: 52px;
-}
-.logo {
-  font-size: 15px;
-  font-weight: 700;
-  color: var(--text);
-  white-space: nowrap;
-  letter-spacing: -0.3px;
-}
-.collapsed .logo {
-  display: none;
-}
-
-.icon-btn {
-  background: var(--bg-surface0);
-  border: 1px solid var(--border);
-  color: var(--text);
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 14px;
-  min-width: 32px;
-  height: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.15s;
-}
-.icon-btn:hover {
-  background: var(--bg-surface1);
-}
-.icon-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.sidebar-actions {
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  border-bottom: 1px solid var(--border);
-}
-.action-row {
-  display: flex;
-  gap: 6px;
-}
-
-.primary-btn {
-  background: var(--blue);
-  color: var(--bg-crust);
-  border: none;
-  padding: 10px 12px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 13px;
-  transition: opacity 0.15s;
-}
-.primary-btn:hover {
-  opacity: 0.9;
-}
-.secondary-btn {
-  background: var(--bg-surface0);
-  color: var(--text);
-  border: 1px solid var(--border);
-  padding: 10px 12px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 13px;
-  transition: background 0.15s;
-}
-.secondary-btn:hover {
-  background: var(--bg-surface1);
-}
-
-.folder-info {
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border);
-}
-.folder-path {
-  font-size: 11px;
-  color: var(--subtext1);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: block;
-}
-
-.file-tree {
-  flex: 1;
-  overflow-y: auto;
-  padding: 6px 0;
-}
-.file-tree::-webkit-scrollbar {
-  width: 6px;
-}
-.file-tree::-webkit-scrollbar-thumb {
-  background: var(--bg-surface1);
-  border-radius: 3px;
-}
-
-.file-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 14px;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--subtext0);
-  transition: background 0.1s;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.file-item:hover {
-  background: var(--bg-surface0);
-  color: var(--text);
-}
-.file-item.active {
-  background: var(--bg-surface0);
-  color: var(--blue);
-  border-left: 2px solid var(--blue);
-}
-.file-icon {
-  font-size: 14px;
-  flex-shrink: 0;
-}
-.file-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.rename-input {
-  background: var(--bg-base);
-  border: 1px solid var(--blue);
-  color: var(--text);
-  border-radius: 4px;
-  padding: 2px 6px;
-  font-size: 13px;
-  outline: none;
-  flex: 1;
-  min-width: 0;
-}
-
-/* === Main toolbar === */
-.main {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  height: 100vh;
-}
-
-.editor {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-.editor-toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 16px;
-  background: var(--bg-crust);
-  border-bottom: 1px solid var(--border);
-}
-.file-name {
-  font-size: 12px;
-  color: var(--subtext1);
-  font-family: monospace;
-}
-.save-hint {
-  font-size: 11px;
-  color: var(--subtext1);
-}
-.editor-body {
-  flex: 1;
-  overflow: hidden;
-  background: var(--bg-base);
-}
-
-/* === Graph view === */
-.graph-view {
-  width: 100%;
-  height: 100vh;
-  background: var(--bg-base);
-  position: relative;
-}
-.graph-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  gap: 8px;
-  color: var(--subtext1);
-}
-.graph-empty h3 {
-  font-size: 18px;
-  color: var(--text);
-  font-weight: 500;
-}
-.graph-empty p {
-  font-size: 14px;
-}
-
-/* === Dark mode overrides for third-party components === */
-html[data-color-mode='dark'] .wmde-markdown {
-  background: var(--bg-base) !important;
-  color: var(--text) !important;
-  border-color: var(--border) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .toolbar {
-  background: var(--bg-crust) !important;
-  border-color: var(--border) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .toolbar-item {
-  color: var(--text) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .toolbar-item:hover {
-  background: var(--bg-surface0) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .preview {
-  background: var(--bg-base) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .preview h1,
-html[data-color-mode='dark'] .wmde-markdown .preview h2,
-html[data-color-mode='dark'] .wmde-markdown .preview h3 {
-  color: var(--text) !important;
-  border-color: var(--border) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .preview a {
-  color: var(--blue) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .preview code {
-  background: var(--bg-surface0) !important;
-  color: var(--text) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .preview pre {
-  background: var(--bg-crust) !important;
-  border-color: var(--border) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .preview blockquote {
-  border-left-color: var(--blue) !important;
-  color: var(--subtext0) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown textarea {
-  background: var(--bg-base) !important;
-  color: var(--text) !important;
-}
-html[data-color-mode='dark'] .wmde-markdown .editor textarea {
-  background: var(--bg-base) !important;
-  color: var(--text) !important;
-  caret-color: var(--text) !important;
-}
-</file>
-
-<file path="renderer/src/App.tsx">
-import { useState, useCallback } from 'react'
-import Sidebar from './components/Sidebar'
-import Editor from './components/Editor'
-import GraphView from './components/GraphView'
-import './App.css'
-
-type View = 'editor' | 'graph'
-type FileEntry = { name: string; path: string; isDirectory: boolean }
-
-function App() {
-  const [view, setView] = useState<View>('editor')
-  const [rootDir, setRootDir] = useState<string | null>(null)
-  const [files, setFiles] = useState<FileEntry[]>([])
-  const [allFiles, setAllFiles] = useState<FileEntry[]>([])
-  const [activeFile, setActiveFile] = useState<string | null>(null)
-  const [content, setContent] = useState('')
-  const [collapsed, setCollapsed] = useState(false)
-  const [refreshToken, setRefreshToken] = useState(0)
-  const [pendingRename, setPendingRename] = useState<string | null>(null)
-
-  const loadRootDir = useCallback(async (dir: string) => {
-    setRootDir(dir)
-    setActiveFile(null)
-    setContent('')
-    setRefreshToken(0)
-    setPendingRename(null)
-    const entries = await window.electronAPI.readDir(dir)
-    setFiles(entries)
-    const walked = await window.electronAPI.walk(dir)
-    setAllFiles(walked)
-  }, [])
-
-  const refreshFileList = useCallback(async () => {
-    if (!rootDir) return
-    const entries = await window.electronAPI.readDir(rootDir)
-    setFiles(entries)
-    const walked = await window.electronAPI.walk(rootDir)
-    setAllFiles(walked)
-  }, [rootDir])
-
-  const selectRootDir = async () => {
-    const dir = await window.electronAPI.selectFolder()
-    if (dir) {
-      await loadRootDir(dir)
-    }
-  }
-
-  const openFile = async (filePath: string) => {
-    if (filePath.endsWith('/')) return
-    setActiveFile(filePath)
-    const text = await window.electronAPI.readFile(filePath)
-    setContent(text)
-    setView('editor')
-  }
-
-  const saveContent = async () => {
-    if (!activeFile) return
-    await window.electronAPI.writeFile(activeFile, content)
-    await refreshFileList()
-  }
-
-  const createNote = async () => {
-    if (!rootDir) return
-    const safeName = `Untitled ${Date.now()}.md`
-    const fullPath = await window.electronAPI.createFile(rootDir, safeName)
-    setPendingRename(fullPath)
-    setRefreshToken((t) => t + 1)
-    await refreshFileList()
-  }
-
-  const createFolder = async () => {
-    if (!rootDir) return
-    await window.electronAPI.createFolder(rootDir, 'New Folder')
-    setRefreshToken((t) => t + 1)
-    await refreshFileList()
-  }
-
-  const renameFile = async (oldPath: string, newName: string) => {
-    const dir = oldPath.substring(0, oldPath.lastIndexOf('/'))
-    const newPath = dir + '/' + newName
-    await window.electronAPI.rename(oldPath, newPath)
-    if (activeFile === oldPath) {
-      setActiveFile(newPath)
-    }
-    await refreshFileList()
-  }
-
-  return (
-    <div className="app">
-      <Sidebar
-        files={files}
-        activeFile={activeFile}
-        collapsed={collapsed}
-        view={view}
-        rootDir={rootDir}
-        refreshToken={refreshToken}
-        pendingRename={pendingRename}
-        onSelectRoot={selectRootDir}
-        onOpenFile={openFile}
-        onCreateNote={createNote}
-        onCreateFolder={createFolder}
-        onToggleView={() => setView(view === 'editor' ? 'graph' : 'editor')}
-        onToggleSidebar={() => setCollapsed(!collapsed)}
-        onRename={renameFile}
-        onClearPendingRename={() => setPendingRename(null)}
-      />
-      <main className="main">
-        {view === 'editor' ? (
-          <Editor
-            content={content}
-            onChange={setContent}
-            onSave={saveContent}
-            fileName={activeFile ? activeFile.split('/').pop()! : 'No file open'}
-          />
-        ) : (
-          <GraphView allFiles={allFiles} rootDir={rootDir} onOpenFile={openFile} />
-        )}
-      </main>
-    </div>
-  )
-}
-
-export default App
-</file>
-
-<file path="renderer/src/main.tsx">
-import React from 'react'
-import ReactDOM from 'react-dom/client'
-import App from './App'
-
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
 )
-</file>
 
-<file path="renderer/index.html">
-<!DOCTYPE html>
-<html lang="en" data-color-mode="dark">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Marktree</title>
-    <style>
-      * { margin: 0; padding: 0; box-sizing: border-box; }
-      html, body, #root { height: 100%; width: 100%; overflow: hidden;
-        background: #1e1e2e; color: #cdd6f4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-    </style>
-  </head>
-  <body>
-  <div id="root"></div>
-  <script type="module" src="/src/main.tsx"></script>
-  <script>
-    document.documentElement.setAttribute('data-color-mode', 'dark')
-  </script>
-</html>
+ipcMain.handle('ai:loadConfig', async () => loadAIConfig())
+ipcMain.handle('ai:saveConfig', async (_event, config) => saveAIConfig(config))
 </file>
 
 </files>

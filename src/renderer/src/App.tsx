@@ -1,6 +1,7 @@
-import { useState, useCallback, lazy, Suspense } from 'react'
+import { useState, useCallback, useEffect, lazy, Suspense } from 'react'
 import Sidebar from './components/Sidebar'
 import Editor from './components/Editor'
+import AIChatPanel from './components/ai/AIChatPanel'
 import './App.css'
 
 const GraphView = lazy(() => import('./components/GraphView'))
@@ -18,6 +19,7 @@ function App() {
   const [collapsed, setCollapsed] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
   const [pendingRename, setPendingRename] = useState<string | null>(null)
+  const [aiCollapsed, setAiCollapsed] = useState(true)
 
   const loadRootDir = useCallback(async (dir: string) => {
     setRootDir(dir)
@@ -38,6 +40,17 @@ function App() {
     const walked = await window.electronAPI.walk(rootDir)
     setAllFiles(walked)
   }, [rootDir])
+
+  useEffect(() => {
+    const handleFileChange = (event: { filePath: string; action: 'created' | 'modified' }) => {
+      console.log('[App] file change notification received:', event)
+      refreshFileList()
+    }
+    window.electronAPI.onFileChange(handleFileChange)
+    return () => {
+      window.electronAPI.offFileChange(handleFileChange)
+    }
+  }, [refreshFileList])
 
   const selectRootDir = async () => {
     const dir = await window.electronAPI.selectFolder()
@@ -120,6 +133,16 @@ function App() {
           </Suspense>
         )}
       </main>
+      <AIChatPanel
+        context={{
+          rootDir,
+          activeFile,
+          activeContent: content,
+          allFiles,
+        }}
+        collapsed={aiCollapsed}
+        onToggle={() => setAiCollapsed(!aiCollapsed)}
+      />
     </div>
   )
 }
